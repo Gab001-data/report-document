@@ -1,0 +1,1203 @@
+import requests
+import pandas
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+from ast import literal_eval
+import re
+from html import unescape
+from typing import Any, Optional
+
+# Variables
+highbond_token = hcl.secret['v_hb_token'].unmask()
+hb_org_id = hcl.system_variable["organization_id"]
+hb_page_url = hcl.system_variable["hb_api_host"]
+hb_base_url = f"{hb_page_url}/v1/orgs/{hb_org_id}"
+payload = {}
+headers = {
+    "Accept-Encoding": "application/vnd.api+json",
+    "Authorization": f"Bearer {highbond_token}"
+}
+
+# Functions
+def _paginate(url):
+    """Yield JSON payloads while following HighBond API pagination.
+    Parameters
+    ----------
+    url : str
+        Fully qualified resource URL to request.
+    Yields
+    ------
+    dict
+        Response payload for each page in sequence.
+    """
+    next_url = url
+    while next_url:
+        response = requests.request("GET", next_url, headers=headers, data=payload)
+        response.raise_for_status()
+        payload_json = response.json()
+        yield payload_json
+        next_link = payload_json.get("links", {}).get("next")
+        next_url = f"{hb_page_url}{next_link}" if next_link else None
+
+def _normalize_payload(payload_json):
+    """Convert a JSON:API payload into a tabular DataFrame.
+    Parameters
+    ----------
+    payload_json : dict
+        Response content returned by the HighBond API.
+    Returns
+    -------
+    pandas.DataFrame
+        Normalized representation of the payload data.
+    """
+    data_section = payload_json.get("data")
+    if isinstance(data_section, list):
+        return pandas.json_normalize(data_section)
+    if isinstance(data_section, dict):
+        return pandas.json_normalize([data_section])
+    return pandas.DataFrame()
+
+def get_hb_api_data(url):
+    """Collect a paginated HighBond resource and combine the pages.
+    Parameters
+    ----------
+    url : str
+        Endpoint used to initiate the paginated requests.
+    Returns
+    -------
+    pandas.DataFrame
+        Concatenated rows from every retrieved page.
+    """
+    frames = []
+    for payload_json in _paginate(url):
+        frame = _normalize_payload(payload_json)
+        if not frame.empty:
+            frames.append(frame)
+    return pandas.concat(frames, ignore_index=True) if frames else pandas.DataFrame()
+
+def _resource_url(resource_type, identifier):
+    """Build the HighBond API URL for a given resource type.
+    Parameters
+    ----------
+    resource_type : str
+        One of the supported resource categories (e.g., "controls").
+    identifier : str
+        Identifier required by resource types that target a specific row.
+    Returns
+    -------
+    str
+        Fully qualified API URL ready for requests.
+    """
+    if resource_type == "requirements":
+        return (
+            f"{hb_base_url}/compliance_regulations/{identifier}"
+            "/compliance_requirements?fields[compliance_requirements]="
+            "identifier,name,description,created_at,updated_at,external_id,"
+            "external_parent_id,tags,rationale,applicable,covered,coverage,"
+            "position,compliance_regulation,parent,compliance_mappings"
+        )
+    if resource_type == "compliance":
+        return (
+            f"{hb_base_url}/compliance_mappings/{identifier}"
+            "?fields[compliance_mappings]=coverage,created_at,updated_at,"
+            "compliance_requirement,control"
+        )
+    if resource_type == "controls":
+        return (f"{hb_base_url}/controls?fields[controls]=title,description,owner,"
+        "frequency,control_type,prevent_detect,walkthrough,control_test_plan,control_tests,mitigations,framework_origin")
+    if resource_type == "issues":
+        return (f"{hb_base_url}/issues?fields[issues]=title,description,recommendation,"
+        "risk,owner,remediation_status,remediation_plan,remediation_date,target")
+    if resource_type == "mitigations":
+        return f"{hb_base_url}/mitigations/{identifier}"
+    if resource_type == "risks":
+        return f"{hb_base_url}/risks/{identifier}?fields[risks]=title,description,risk_assurance_data"
+    if resource_type == "actions":
+        return f"{hb_base_url}/issues/{identifier}/actions"
+    if resource_type == "walkthroughs":
+        return f"{hb_base_url}/walkthroughs/{identifier}"
+    if resource_type == "control_tests":
+        return f"{hb_base_url}/control_tests/{identifier}"
+    raise ValueError(f"Unsupported resource type: {resource_type}")
+
+def _fetch_resource(resource_type, identifier):
+    """Retrieve and normalize a single HighBond resource.
+    Parameters
+    ----------
+    resource_type : str
+        Category of resource to request.
+    identifier : str
+        Identifier or reference required by the endpoint.
+    Returns
+    -------
+    pandas.DataFrame
+        Normalized data for the requested resource.
+    """
+    url = _resource_url(resource_type, identifier)
+    frames = []
+    for payload_json in _paginate(url):
+        frame = _normalize_payload(payload_json)
+        if not frame.empty:
+            frames.append(frame)
+    return pandas.concat(frames, ignore_index=True) if frames else pandas.DataFrame()
+
+def _fetch_in_parallel(resource_type, id_iterable="N/A"):
+    """Fetch multiple HighBond resources concurrently.
+    Parameters
+    ----------
+    resource_type : str
+        Category of resource to request.
+    id_iterable : Iterable[str]
+        Identifiers to request; falsy or missing values are ignored.
+    Returns
+    -------
+    pandas.DataFrame
+        Combined results for every successfully retrieved identifier.
+    """
+    identifiers = [identifier for identifier in id_iterable if pandas.notna(identifier)]
+    if not identifiers:
+        return pandas.DataFrame()
+    try:
+        worker_count = min(8, max(1, len(identifiers)))
+    except TypeError:
+        worker_count = 8
+
+    def _fetch_single(identifier):
+        return _fetch_resource(resource_type, identifier)
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        results = list(executor.map(_fetch_single, identifiers))
+
+    frames = [frame for frame in results if not frame.empty]
+    return pandas.concat(frames, ignore_index=True) if frames else pandas.DataFrame()
+
+def coerce(obj):
+    """Convert serialized JSON fragments into Python objects when possible.
+    Parameters
+    ----------
+    obj : Any
+        Value to normalize; strings are parsed when they contain JSON-like data.
+    Returns
+    -------
+    Any
+        Parsed Python object or the original value when no conversion occurs.
+    """
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s == "" or s.lower() in {"none", "null"}:
+            return np.nan
+        try:
+            return literal_eval(s)   
+        except Exception:
+            return np.nan
+    return obj
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+def strip_html(df: pandas.DataFrame, column: str, target_column: Optional[str] = None) -> pandas.DataFrame:
+    """Return a DataFrame with HTML stripped from the chosen column."""
+    if column not in df.columns:
+        raise KeyError(f"Column '{column}' not found in DataFrame")
+
+    target = column if target_column is None else target_column
+
+    def _clean(value: Any) -> Any:
+        if pandas.isna(value):
+            return value
+        text = unescape(str(value))
+        text = _TAG_RE.sub("", text)
+        return unescape(text).strip()
+
+    df.loc[:, target] = df[column].map(_clean)
+    return df
+
+def merge_suffix_pairs(df, suffixes=("_x", "_y"), sep=" / "):
+    """Collapse duplicate columns that share a base name but differ by suffix.
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame containing the suffixed columns.
+    suffixes : tuple[str, ...]
+        Column suffixes that should be merged together.
+    sep : str
+        Separator used when multiple distinct values must be preserved.
+    Returns
+    -------
+    pandas.DataFrame
+        The same DataFrame instance with suffix columns merged into one.
+    """
+    suffixes = tuple(suffixes)
+    suffix_groups = {}
+    for column in df.columns:
+        for suffix in suffixes:
+            if column.endswith(suffix):
+                base = column[:-len(suffix)]
+                suffix_groups.setdefault(base, []).append(column)
+                break
+
+    for base, variants in suffix_groups.items():
+        ordered = ([base] if base in df.columns else []) + variants
+        subset = df[ordered]
+
+        def _combine(values):
+            results = []
+            seen_keys = set()
+            for value in values:
+                if pandas.isna(value):
+                    continue
+                if isinstance(value, str):
+                    trimmed = value.strip()
+                    if not trimmed:
+                        continue
+                    key = ("str", trimmed.lower())
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    results.append(trimmed)
+                else:
+                    key = ("obj", repr(value))
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    results.append(value)
+            if not results:
+                return np.nan
+            if len(results) == 1:
+                return results[0]
+            return sep.join(str(v) for v in results)
+
+        df[base] = subset.apply(_combine, axis=1)
+        drop_targets = [col for col in variants if col in df.columns and col != base]
+        df.drop(columns=drop_targets, inplace=True)
+
+    return df
+
+def explode_relationship_column(
+    df,
+    column,
+    result_column=None,
+    value_key="id",
+    drop_original=False,
+    reset_index=False,
+    inplace=False,
+):
+    """Explode a relationship column into rows while optionally mutating the original DataFrame."""
+    if column not in df.columns:
+        raise KeyError(f"Column '{column}' not found in DataFrame")
+
+    if result_column is None:
+        parts = [part for part in column.split('.') if part]
+        if parts and parts[-1] == 'data':
+            parts.pop()
+        inferred = parts[-1] if parts else 'value'
+        result_column = f"{inferred}_{value_key}"
+
+    frame = df if inplace else df.copy()
+    frame[column] = frame[column].map(coerce)
+    exploded = frame.explode(column, ignore_index=False)
+
+    def _extract(value):
+        if isinstance(value, dict):
+            return value.get(value_key, np.nan)
+        return np.nan
+
+    exploded[result_column] = exploded[column].map(_extract)
+
+    if drop_original and column in exploded.columns:
+        exploded = exploded.drop(columns=[column])
+
+    if reset_index:
+        exploded = exploded.reset_index(drop=True)
+
+    if inplace:
+        df.drop(df.index, inplace=True)
+        for col in list(df.columns):
+            df.drop(columns=col, inplace=True)
+        for col in exploded.columns:
+            df[col] = exploded[col]
+        if not reset_index:
+            df.index = exploded.index
+        return df
+
+    return exploded
+
+def extract_matching_issue_ids(df, column='Issue ID', separator=' / ', unique=True, **filters):
+    """Return a list of issue identifiers found in ``df``.
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame that contains issue information (for example ``df9``).
+    column : str, optional
+        Name of the column that stores issue identifiers once merges are complete.
+    separator : str, optional
+        Separator used when multiple identifiers were combined into a single cell.
+    unique : bool, optional
+        When True (default) each identifier appears at most once in the result.
+    **filters
+        Optional column=value filters applied before collecting identifiers.
+    Returns
+    -------
+    list[str]
+        Identifiers that can be passed to subsequent API requests.
+    """
+    if df.empty:
+        return []
+
+    if column not in df.columns:
+        raise KeyError(f"Column {column!r} not found in DataFrame")
+
+    working = df
+    for field, criterion in filters.items():
+        if field not in working.columns:
+            raise KeyError(f"Column {field!r} not found in DataFrame")
+        if isinstance(criterion, (list, tuple, set, frozenset)):
+            working = working[working[field].isin(criterion)]
+        else:
+            working = working[working[field] == criterion]
+
+    if working.empty:
+        return []
+
+    results = []
+    seen = set()
+
+    for raw in working[column].dropna():
+        if isinstance(raw, str):
+            candidates = [part.strip() for part in raw.split(separator)]
+        elif isinstance(raw, (list, tuple, set, frozenset)):
+            candidates = [str(part).strip() for part in raw]
+        else:
+            candidates = [str(raw).strip()]
+
+        for candidate in candidates:
+            value = candidate.strip()
+            if not value or value.lower() == 'nan':
+                continue
+            if unique:
+                if value in seen:
+                    continue
+                seen.add(value)
+            results.append(value)
+
+    return results
+
+def collapse_issue_actions(
+    df,
+    issue_column='Issue ID',
+    columns=None,
+    separator=' / ',
+    dropna_issue=True,
+    deduplicate=False,
+):
+    """Collapse multiple action rows per issue into a single record per issue.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame that contains action records returned by ``_fetch_in_parallel``.
+    issue_column : str, optional
+        Column whose values identify the parent issue for each action row.
+    columns : Iterable[str] | None, optional
+        Columns to concatenate for each issue. When ``None`` (default) every
+        column except ``issue_column`` is processed.
+    separator : str, optional
+        Text used to separate multiple values in the collapsed output.
+    dropna_issue : bool, optional
+        When True (default) rows missing an issue identifier are excluded.
+    deduplicate : bool, optional
+        When True repeated values are removed while combining (default ``False``).
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame with one row per issue and concatenated column values.
+    """
+    if df.empty:
+        return df.copy()
+
+    if issue_column not in df.columns:
+        raise KeyError(f"Column {issue_column!r} not found in DataFrame")
+
+    working = df.copy()
+    if dropna_issue:
+        working = working[working[issue_column].notna()]
+    if working.empty:
+        return working[[issue_column]].drop_duplicates().reset_index(drop=True)
+
+    if columns is None:
+        columns = [col for col in working.columns if col != issue_column]
+    else:
+        missing = [col for col in columns if col not in working.columns]
+        if missing:
+            raise KeyError(f"Columns {missing} not found in DataFrame")
+
+    def _normalise(value):
+        if isinstance(value, str):
+            parts = [part.strip() for part in value.split(separator)]
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            parts = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item.strip())
+                elif pandas.isna(item):
+                    parts.append('')
+                else:
+                    parts.append(str(item).strip())
+        else:
+            if pandas.isna(value):
+                return ['']
+            parts = [str(value).strip()]
+
+        if not parts:
+            return ['']
+        return [part if part is not None else '' for part in parts]
+
+    def _join(series):
+        values = []
+        seen = set() if deduplicate else None
+        for value in series:
+            for text in _normalise(value):
+                lowered = text.lower() if isinstance(text, str) else str(text).lower()
+                if lowered == 'nan':
+                    continue
+                key = lowered if text else '__blank__'
+                if seen is not None:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                values.append(text)
+        if not values:
+            return np.nan
+        return separator.join(values)
+
+    aggregated = working.groupby(issue_column, dropna=False)[columns].agg(_join).reset_index()
+    return aggregated
+
+def join_actions_to_df(
+    df,
+    actions_df,
+    df_issue_column="Issue ID",
+    actions_issue_column="Issue ID",
+    separator=" / ",
+    suffix="_action",
+    how="left",
+    deduplicate=False,
+):
+    """Join actions data onto ``df`` rows even when issue identifiers are concatenated.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Target DataFrame that includes an issue identifier column (for example ``df9``).
+    actions_df : pandas.DataFrame
+        DataFrame that provides action details keyed by ``actions_issue_column``.
+    df_issue_column : str, optional
+        Column in ``df`` that stores one or more issue identifiers, optionally separated by ``separator``.
+    actions_issue_column : str, optional
+        Column in ``actions_df`` whose values identify the parent issue for each record.
+    separator : str, optional
+        Delimiter used when multiple issue identifiers share a single cell in ``df_issue_column``.
+    suffix : str, optional
+        Suffix appended to action columns when they are joined back to ``df``.
+    how : str, optional
+        Merge strategy applied between exploded ``df`` rows and ``actions_df`` (default ``"left"``).
+    deduplicate : bool, optional
+        When True repeated values are removed while combining (default ``False``).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Copy of ``df`` augmented with the aggregated action columns.
+    """
+    if df.empty or actions_df.empty:
+        return df.copy()
+
+    if df_issue_column not in df.columns:
+        raise KeyError(f"Column {df_issue_column!r} not found in DataFrame")
+    if actions_issue_column not in actions_df.columns:
+        raise KeyError(f"Column {actions_issue_column!r} not found in actions DataFrame")
+
+    def _split(value):
+        if pandas.isna(value):
+            return [np.nan]
+        if isinstance(value, str):
+            parts = [part.strip() for part in value.split(separator)]
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            parts = [str(part).strip() for part in value]
+        else:
+            parts = [str(value).strip()]
+        cleaned = [part for part in parts if part and part.lower() != 'nan']
+        return cleaned if cleaned else [np.nan]
+
+    def _normalise(value):
+        if isinstance(value, str):
+            parts = [part.strip() for part in value.split(separator)]
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            parts = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item.strip())
+                elif pandas.isna(item):
+                    parts.append('')
+                else:
+                    parts.append(str(item).strip())
+        else:
+            if pandas.isna(value):
+                return ['']
+            parts = [str(value).strip()]
+
+        if not parts:
+            return ['']
+        return [part if part is not None else '' for part in parts]
+
+    def _combine(series):
+        values = []
+        seen = set() if deduplicate else None
+        for raw in series:
+            for text in _normalise(raw):
+                lowered = text.lower() if isinstance(text, str) else str(text).lower()
+                if lowered == 'nan':
+                    continue
+                key = lowered if text else '__blank__'
+                if seen is not None:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                values.append(text)
+        if not values:
+            return np.nan
+        return separator.join(values)
+
+    working = df.copy()
+    working["__row_id"] = np.arange(len(working))
+    working["__issue_id"] = working[df_issue_column].map(_split)
+    exploded = working.explode("__issue_id")
+
+    merged = exploded.merge(
+        actions_df,
+        left_on="__issue_id",
+        right_on=actions_issue_column,
+        how=how,
+        suffixes=("", suffix),
+    )
+
+    action_columns = [col for col in actions_df.columns if col != actions_issue_column]
+    if not action_columns:
+        return df.copy()
+
+    aggregated = merged[["__row_id"] + action_columns]
+    aggregated = aggregated.groupby("__row_id", dropna=False).agg(_combine).reset_index()
+
+    result = df.copy()
+    result["__row_id"] = np.arange(len(result))
+    result = result.merge(aggregated, on="__row_id", how="left", suffixes=("", suffix))
+    result.drop(columns=["__row_id"], inplace=True)
+    return result
+
+def fetch_source_frames():
+    """Retrieve core HighBond tables required for the compliance report."""
+    regulations_df = get_hb_api_data(f"{hb_base_url}/compliance_regulations")
+    regulation_ids = regulations_df['id'] if 'id' in regulations_df.columns else pandas.Series(dtype='object')
+
+    requirements_df = _fetch_in_parallel('requirements', regulation_ids)
+
+    if not requirements_df.empty and 'relationships.compliance_mappings.data' in requirements_df.columns:
+        compliance_map_mask = requirements_df['relationships.compliance_mappings.data'].apply(
+            lambda value: isinstance(value, list) and len(value) > 0
+        )
+        compliance_candidate_df = requirements_df[compliance_map_mask]
+    else:
+        compliance_candidate_df = requirements_df.iloc[0:0].copy()
+
+    if compliance_candidate_df.empty:
+        compliance_maps_df_flat = pandas.DataFrame(columns=['_id', 'id'])
+    else:
+        compliance_records = compliance_candidate_df.to_dict(orient='records')
+        compliance_maps_df_flat = pandas.json_normalize(
+            compliance_records,
+            record_path='relationships.compliance_mappings.data',
+            record_prefix='_',
+            meta=['id'],
+        )
+
+    compliance_ids = compliance_maps_df_flat['_id'].tolist() if not compliance_maps_df_flat.empty else []
+    compliance_maps_df = _fetch_in_parallel('compliance', compliance_ids)
+
+    controls_df = _fetch_in_parallel('controls')
+    if not controls_df.empty and 'relationships.control_tests.data' in controls_df.columns:
+        explode_relationship_column(
+            controls_df,
+            'relationships.control_tests.data',
+            result_column='control_test_id',
+            inplace=True,
+            reset_index=True,
+        )
+
+    issues_df = _fetch_in_parallel('issues')
+
+    col = 'relationships.mitigations.data'
+    prepared_controls = controls_df.copy()
+    if col in prepared_controls.columns:
+        prepared_controls[col] = prepared_controls[col].map(coerce)
+        mitigations_map_df = prepared_controls.explode(col)
+        mitigations_map_df['mitigation_id'] = mitigations_map_df[col].map(
+            lambda d: d.get('id') if isinstance(d, dict) else np.nan
+        )
+    else:
+        mitigations_map_df = pandas.DataFrame({'id': [], 'mitigation_id': []})
+
+    mitigation_ids = mitigations_map_df['mitigation_id'] if 'mitigation_id' in mitigations_map_df.columns else pandas.Series(dtype='object')
+    mitigations_df = _fetch_in_parallel('mitigations', mitigation_ids)
+
+    if not mitigations_df.empty and 'relationships.risk.data.id' in mitigations_df.columns:
+        risk_ids = mitigations_df['relationships.risk.data.id']
+    else:
+        risk_ids = pandas.Series(dtype='object')
+    risks_df = _fetch_in_parallel('risks', risk_ids)
+
+    return {
+        'regulations': regulations_df,
+        'requirements': requirements_df,
+        'compliance_maps': compliance_maps_df,
+        'controls': controls_df,
+        'issues': issues_df,
+        'mitigations': mitigations_df,
+        'risks': risks_df,
+        'walkthroughs': pandas.DataFrame(),
+        'control_tests': pandas.DataFrame(),
+    }
+
+def assemble_issue_dataframe(frames, merge_suffixes=None):
+    """Build the combined compliance dataframe (``df9`` in the original notebook)."""
+    merge_suffixes = merge_suffixes or ('_x', '_y', '_control_issue', '_test_plan_issue', '_walkthrough_issue', '_control_test_issue')
+
+    regulations_df = frames.get('regulations', pandas.DataFrame())
+    requirements_df = frames.get('requirements', pandas.DataFrame())
+    compliance_maps_df = frames.get('compliance_maps', pandas.DataFrame())
+    controls_df = frames.get('controls', pandas.DataFrame())
+    mitigations_df = frames.get('mitigations', pandas.DataFrame())
+    risks_df = frames.get('risks', pandas.DataFrame())
+    issues_df = frames.get('issues', pandas.DataFrame())
+
+    def _slice_and_rename(df, mapping):
+        if df.empty:
+            return pandas.DataFrame(columns=list(mapping.values()))
+        missing = [col for col in mapping if col not in df.columns]
+        if missing:
+            raise KeyError(f"Columns {missing!r} not found in DataFrame")
+        result = df[list(mapping)].copy()
+        result.columns = list(mapping.values())
+        return result
+
+    regulations_final = _slice_and_rename(
+        regulations_df,
+        {
+            'id': 'Regulation ID',
+            'attributes.name': 'Regulation Name',
+            'attributes.description': 'Regulation Description',
+        },
+    )
+
+    requirements_final = _slice_and_rename(
+        requirements_df,
+        {
+            'id': 'Requirement ID',
+            'attributes.name': 'Requirement Name',
+            'attributes.description': 'Requirement Description',
+            'attributes.covered': 'Covered?',
+            'attributes.coverage': 'Coverage',
+            'relationships.compliance_regulation.data.id': 'Regulation ID',
+        },
+    )
+
+    compliance_final = _slice_and_rename(
+        compliance_maps_df,
+        {
+            'id': 'Compliance Map ID',
+            'relationships.compliance_requirement.data.id': 'Requirement ID',
+            'relationships.control.data.id': 'Framework Control ID',
+        },
+    )
+
+    controls_final = _slice_and_rename(
+        controls_df,
+        {
+            'relationships.framework_origin.data.id': 'Framework Control ID',
+            'attributes.title': 'Control Title',
+            'attributes.description': 'Control Description',
+            'attributes.owner': 'Control Owner',
+            'attributes.frequency': 'Control Frequency',
+            'attributes.control_type': 'Control Type',
+            'attributes.prevent_detect': 'Prevent or Detect?',
+            'id': 'Control ID',
+            'relationships.control_test_plan.data.id': 'Control Test Plan ID',
+            'relationships.walkthrough.data.id': 'Walkthrough ID',
+            'control_test_id': 'Control Test ID',
+        },
+    )
+
+    mitigations_final = _slice_and_rename(
+        mitigations_df,
+        {
+            'relationships.control.data.id': 'Control ID',
+            'relationships.risk.data.id': 'Risk ID',
+        },
+    )
+
+    risks_final = _slice_and_rename(
+        risks_df,
+        {
+            'id': 'Risk ID',
+            'attributes.title': 'Risk Title',
+            'attributes.description': 'Risk Description',
+            'attributes.risk_assurance_data.inherent_risk': 'Inherent Risk',
+            'attributes.risk_assurance_data.residual_risk': 'Residual Risk',
+            'attributes.risk_assurance_data.assurance': 'Assurance',
+        },
+    )
+
+    issues_final = _slice_and_rename(
+        issues_df,
+        {
+            'id': 'Issue ID',
+            'attributes.title': 'Issue Title',
+            'attributes.description': 'Issue Description',
+            'attributes.recommendation': 'Issue Recommendation',
+            'attributes.risk': 'Issue Risk',
+            'attributes.remediation_status': 'Issue Remediation Status',
+            'attributes.remediation_plan': 'Issue Remediation Plan',
+            'attributes.remediation_date': 'Issue Remediation Date',
+            'relationships.target.data.type': 'Target Type',
+            'relationships.target.data.id': 'Target ID',
+        },
+    )
+
+    issues_controls = issues_final[issues_final['Target Type'] == 'controls'] if 'Target Type' in issues_final.columns else pandas.DataFrame(columns=issues_final.columns)
+    issues_control_test_plans = issues_final[issues_final['Target Type'] == 'control_test_plans'] if 'Target Type' in issues_final.columns else pandas.DataFrame(columns=issues_final.columns)
+    issues_walkthroughs = issues_final[issues_final['Target Type'] == 'walkthroughs'] if 'Target Type' in issues_final.columns else pandas.DataFrame(columns=issues_final.columns)
+    issues_control_tests = issues_final[issues_final['Target Type'] == 'control_tests'] if 'Target Type' in issues_final.columns else pandas.DataFrame(columns=issues_final.columns)
+
+    df1 = pandas.merge(regulations_final, requirements_final, on='Regulation ID', how='left')
+    df2 = pandas.merge(df1, compliance_final, on='Requirement ID', how='left')
+    controls_filtered = controls_final[controls_final['Framework Control ID'].notna()] if 'Framework Control ID' in controls_final.columns else controls_final
+    df3 = pandas.merge(df2, controls_filtered, on='Framework Control ID', how='left')
+    df4 = pandas.merge(df3, mitigations_final, on='Control ID', how='left')
+    df5 = pandas.merge(df4, risks_final, on='Risk ID', how='left')
+    df6 = pandas.merge(df5, issues_controls, left_on='Control ID', right_on='Target ID', how='left', suffixes=('', '_control_issue'))
+    df7 = pandas.merge(df6, issues_control_test_plans, left_on='Control Test Plan ID', right_on='Target ID', how='left', suffixes=('', '_test_plan_issue'))
+    df8 = pandas.merge(df7, issues_walkthroughs, left_on='Walkthrough ID', right_on='Target ID', how='left', suffixes=('', '_walkthrough_issue'))
+    df9 = pandas.merge(df8, issues_control_tests, left_on='Control Test ID', right_on='Target ID', how='left', suffixes=('', '_control_test_issue'))
+
+    df9.drop_duplicates(inplace=True)
+    df9 = merge_suffix_pairs(df9, suffixes=merge_suffixes)
+    return df9
+
+def build_actions_data(
+    df9,
+    separator=' / ',
+    action_field_map=None,
+    deduplicate=False,
+):
+    """Fetch, reshape, and collapse action records associated with the supplied dataframe."""
+    field_map = action_field_map or {
+        'relationships.issue.data.id': 'Issue ID',
+        'attributes.title': 'Action Title',
+        'attributes.description': 'Action Description',
+        'attributes.owner_name': 'Action Owner Name',
+        'attributes.due_date': 'Action Due Date',
+        'attributes.priority': 'Action Priority',
+    }
+
+    issue_ids = extract_matching_issue_ids(df9, separator=separator)
+    if not issue_ids:
+        empty_columns = list(field_map.values())
+        return {
+            'raw': pandas.DataFrame(),
+            'prepped': pandas.DataFrame(columns=empty_columns),
+            'collapsed': pandas.DataFrame(columns=empty_columns),
+        }
+
+    actions_df = _fetch_in_parallel('actions', issue_ids)
+    if actions_df.empty:
+        empty_columns = list(field_map.values())
+        return {
+            'raw': actions_df,
+            'prepped': pandas.DataFrame(columns=empty_columns),
+            'collapsed': pandas.DataFrame(columns=empty_columns),
+        }
+
+    missing = [column for column in field_map if column not in actions_df.columns]
+    if missing:
+        raise KeyError(f"Columns {missing!r} not found in actions DataFrame")
+
+    actions_prepped = actions_df[list(field_map)].copy()
+    actions_prepped.columns = list(field_map.values())
+
+    collapsed = collapse_issue_actions(
+        actions_prepped,
+        issue_column='Issue ID',
+        separator=separator,
+        deduplicate=deduplicate,
+    )
+
+    return {
+        'raw': actions_df,
+        'prepped': actions_prepped,
+        'collapsed': collapsed,
+    }
+
+def finalize_report(
+    df9,
+    actions_data,
+    separator=' / ',
+    drop_id_columns=True,
+    drop_target_type=True,
+    deduplicate=False,
+):
+    """Attach actions to ``df9`` and optionally drop identifier columns."""
+    collapsed_actions = actions_data.get('collapsed', pandas.DataFrame()) if isinstance(actions_data, dict) else actions_data
+
+    if isinstance(actions_data, dict) and 'collapsed' in actions_data:
+        collapsed_actions = actions_data['collapsed']
+    else:
+        collapsed_actions = pandas.DataFrame() if collapsed_actions is None else collapsed_actions
+
+    if collapsed_actions.empty:
+        df_with_actions = df9.copy()
+    else:
+        df_with_actions = join_actions_to_df(
+            df9,
+            collapsed_actions,
+            df_issue_column='Issue ID',
+            actions_issue_column='Issue ID',
+            separator=separator,
+            deduplicate=deduplicate,
+        )
+
+    result = df_with_actions.copy()
+
+    if drop_id_columns:
+        result = drop_identifier_columns(result)
+
+    if drop_target_type and 'Target Type' in result.columns:
+        result = result.drop(columns=['Target Type'])
+
+    return result
+
+def drop_identifier_columns(df: pandas.DataFrame) -> pandas.DataFrame:
+    """Return a copy of ``df`` without columns whose names end with ``ID``."""
+    if df.empty:
+        return df
+    id_columns = [column for column in df.columns if column.upper().endswith('ID')]
+    if not id_columns:
+        return df
+    return df.drop(columns=id_columns)
+
+def collect_unique_ids(df: pandas.DataFrame, column: str, separator: str = ' / ') -> list:
+    """Collect unique identifier values from ``column`` while honouring the merge separator."""
+    if df.empty or column not in df.columns:
+        return []
+
+    values = df[column].dropna()
+    results = []
+    seen = set()
+
+    for value in values:
+        if isinstance(value, str):
+            candidates = [part.strip() for part in value.split(separator)]
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            candidates = [str(part).strip() for part in value]
+        elif isinstance(value, dict):
+            candidate = str(value.get('id', '')).strip()
+            candidates = [candidate] if candidate else []
+        else:
+            candidate = str(value).strip()
+            candidates = [candidate] if candidate else []
+
+        for candidate in candidates:
+            if not candidate or candidate.lower() == 'nan':
+                continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            results.append(candidate)
+
+    return results
+
+def _prepare_supplemental_frame(
+    df: pandas.DataFrame,
+    id_column_name: str,
+    prefix: str,
+    attribute_map: Optional[dict[str, str]] = None,
+) -> pandas.DataFrame:
+    """Subset and rename supplemental resource columns for report merging."""
+    mapped_columns = [attribute_map[key] for key in attribute_map] if attribute_map else []
+    base_columns = [id_column_name] + mapped_columns
+    if df.empty or 'id' not in df.columns:
+        return pandas.DataFrame(columns=base_columns)
+
+    if attribute_map:
+        available = ['id'] + [column for column in attribute_map if column in df.columns]
+        subset = df[available].copy()
+        rename_map = {'id': id_column_name}
+        for column in available:
+            if column == 'id':
+                continue
+            rename_map[column] = attribute_map[column]
+        subset.rename(columns=rename_map, inplace=True)
+
+        missing = [column for column in attribute_map if column not in df.columns]
+        for column in missing:
+            subset[attribute_map[column]] = np.nan
+
+        desired_order = [id_column_name] + [attribute_map[column] for column in attribute_map]
+        subset = subset.reindex(columns=desired_order)
+        return subset
+
+    columns_to_keep = ['id']
+    rename_map = {'id': id_column_name}
+    for column in df.columns:
+        if column.startswith('attributes.'):
+            columns_to_keep.append(column)
+            attribute_name = column.split('.', 1)[1]
+            pretty_name = attribute_name.replace('_', ' ').title()
+            rename_map[column] = f"{prefix} {pretty_name}"
+
+    subset = df[columns_to_keep].copy()
+    subset.rename(columns=rename_map, inplace=True)
+    return subset
+
+def build_walkthrough_data(df: pandas.DataFrame, separator: str = ' / ') -> dict:
+    """Fetch walkthrough metadata for the supplied dataframe."""
+    ids = collect_unique_ids(df, 'Walkthrough ID', separator=separator)
+    result = {
+        'ids': ids,
+        'raw': pandas.DataFrame(),
+        'prepped': pandas.DataFrame(columns=['Walkthrough ID', 'Control Design']),
+    }
+    if not ids:
+        return result
+
+    walkthrough_df = _fetch_in_parallel('walkthroughs', ids)
+    result['raw'] = walkthrough_df
+    result['prepped'] = _prepare_supplemental_frame(
+        walkthrough_df,
+        'Walkthrough ID',
+        'Walkthrough',
+        attribute_map={'attributes.control_design': 'Control Design'},
+    )
+    return result
+
+def build_control_test_data(df: pandas.DataFrame, separator: str = ' / ') -> dict:
+    """Fetch control test metadata for the supplied dataframe."""
+    ids = collect_unique_ids(df, 'Control Test ID', separator=separator)
+    result = {
+        'ids': ids,
+        'raw': pandas.DataFrame(),
+        'prepped': pandas.DataFrame(columns=['Control Test ID', 'Control Effectiveness']),
+    }
+    if not ids:
+        return result
+
+    control_tests_df = _fetch_in_parallel('control_tests', ids)
+    result['raw'] = control_tests_df
+    result['prepped'] = _prepare_supplemental_frame(
+        control_tests_df,
+        'Control Test ID',
+        'Control Test',
+        attribute_map={'attributes.testing_conclusion_status': 'Control Effectiveness'},
+    )
+    return result
+
+def augment_with_walkthroughs_and_control_tests(
+    df: pandas.DataFrame,
+    separator: str = ' / ',
+    drop_id_columns: bool = True,
+    drop_target_type: bool = True,
+):
+    """Append walkthrough and control test attributes to the final report."""
+    working = df.copy()
+
+    walkthrough_data = build_walkthrough_data(working, separator=separator)
+    control_test_data = build_control_test_data(working, separator=separator)
+
+    if not working.empty:
+        if not walkthrough_data['prepped'].empty and 'Walkthrough ID' in working.columns:
+            working = working.merge(
+                walkthrough_data['prepped'],
+                on='Walkthrough ID',
+                how='left',
+            )
+        if not control_test_data['prepped'].empty and 'Control Test ID' in working.columns:
+            working = working.merge(
+                control_test_data['prepped'],
+                on='Control Test ID',
+                how='left',
+            )
+
+    if drop_target_type and 'Target Type' in working.columns:
+        working = working.drop(columns=['Target Type'])
+
+    if drop_id_columns:
+        working = drop_identifier_columns(working)
+
+    supplemental = {
+        'walkthrough_data': walkthrough_data,
+        'control_test_data': control_test_data,
+        'walkthroughs': walkthrough_data['raw'],
+        'control_tests': control_test_data['raw'],
+        'walkthroughs_prepped': walkthrough_data['prepped'],
+        'control_tests_prepped': control_test_data['prepped'],
+        'walkthrough_ids': walkthrough_data['ids'],
+        'control_test_ids': control_test_data['ids'],
+    }
+
+    return working, supplemental
+
+def clean_report_html(
+    df: pandas.DataFrame,
+    suffix: str = 'Description',
+    extra_columns: Optional[list[str]] = None,
+) -> pandas.DataFrame:
+    """Strip HTML tags from description-like columns within ``df``."""
+    if df.empty:
+        return df
+
+    working = df.copy()
+    target_columns = [column for column in working.columns if column.endswith(suffix)]
+
+    if extra_columns:
+        candidates = [extra_columns] if isinstance(extra_columns, str) else list(extra_columns)
+        for candidate in candidates:
+            if candidate in working.columns and candidate not in target_columns:
+                target_columns.append(candidate)
+
+    if not target_columns:
+        return working
+
+    for column in target_columns:
+        strip_html(working, column)
+
+    return working
+
+def generate_compliance_report(
+    datasets=None,
+    separator=' / ',
+    drop_id_columns=True,
+    drop_target_type=True,
+    action_field_map=None,
+    action_deduplicate=False,
+):
+    """Produce the final compliance report dataframe alongside intermediate artifacts."""
+    frames = datasets if datasets is not None else fetch_source_frames()
+    df9 = assemble_issue_dataframe(frames)
+    actions_data = build_actions_data(
+        df9,
+        separator=separator,
+        action_field_map=action_field_map,
+        deduplicate=action_deduplicate,
+    )
+    interim_df = finalize_report(
+        df9,
+        actions_data,
+        separator=separator,
+        drop_id_columns=False,
+        drop_target_type=False,
+        deduplicate=action_deduplicate,
+    )
+    augmented_df, supplemental_data = augment_with_walkthroughs_and_control_tests(
+        interim_df,
+        separator=separator,
+        drop_id_columns=drop_id_columns,
+        drop_target_type=drop_target_type,
+    )
+    final_df = clean_report_html(
+        augmented_df,
+        extra_columns=['Issue Recommendation'],
+    )
+
+    if hasattr(frames, 'items'):
+        frames_context = {key: value for key, value in frames.items()}
+    else:
+        frames_context = dict(frames)
+
+    frames_context['walkthroughs'] = supplemental_data.get('walkthroughs', pandas.DataFrame())
+    frames_context['control_tests'] = supplemental_data.get('control_tests', pandas.DataFrame())
+
+    cleaned_columns = [column for column in final_df.columns if column.endswith('Description')]
+    if 'Issue Recommendation' in final_df.columns:
+        cleaned_columns.append('Issue Recommendation')
+    cleaned_columns = list(dict.fromkeys(cleaned_columns))
+
+    context = {
+        'frames': frames_context,
+        'df9': df9,
+        'actions': actions_data,
+        'supplemental': supplemental_data,
+    }
+    context['html_cleaned_columns'] = cleaned_columns
+    return final_df, context
+
+# Get data
+source_frames = fetch_source_frames()
+regulations_df = source_frames['regulations']
+requirements_df = source_frames['requirements']
+compliance_maps_df = source_frames['compliance_maps']
+controls_df = source_frames['controls']
+issues_df = source_frames['issues']
+mitigations_df = source_frames['mitigations']
+risks_df = source_frames['risks']
+control_tests_df = source_frames['control_tests']
+walkthroughs_df = source_frames['walkthroughs']
+
+
+df, report_context = generate_compliance_report(
+    datasets=source_frames,
+    separator=' / ',
+    drop_id_columns=True,
+    drop_target_type=True,
+    action_deduplicate=False,
+)
+
+df9 = report_context['df9']
+actions_data = report_context['actions']
+actions_df = actions_data['raw']
+actions_final_df = actions_data['prepped']
+collapsed_actions = actions_data['collapsed']
+
+walkthrough_data = report_context['supplemental']['walkthrough_data']
+walkthroughs_df = walkthrough_data['raw']
+walkthroughs_prepped_df = walkthrough_data['prepped']
+
+control_test_data = report_context['supplemental']['control_test_data']
+control_tests_df = control_test_data['raw']
+control_tests_prepped_df = control_test_data['prepped']
+
+if isinstance(source_frames, dict):
+    source_frames['walkthroughs'] = walkthroughs_df
+    source_frames['control_tests'] = control_tests_df
+
+
+if collapsed_actions.empty:
+    df10 = df9.copy()
+else:
+    df10 = join_actions_to_df(
+        df9,
+        collapsed_actions,
+        df_issue_column='Issue ID',
+        actions_issue_column='Issue ID',
+        separator=' / ',
+    )
+
+target_regulation = hcl.variable['v_regulation_filter']
+if len(target_regulation) == 0:
+    df
+else:
+    df = df[df["Regulation Name"] == target_regulation]
+    df
+
+if hcl.variable['v_export_type'] == "Excel":
+    df.to_excel('Compliance_Report.xlsx', index=False)
+    hcl.save_working_file(name = "Compliance_Report.xlsx")
+elif hcl.variable['v_export_type'] == "Results":
+    df.to_hb_results(table_id = hcl.variable['v_table_id'], overwrite = True)
